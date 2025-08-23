@@ -1,0 +1,36 @@
+FROM vllm/vllm-openai:v0.10.1
+
+# Установка дополнительных зависимостей
+RUN pip install --no-cache-dir \
+    pynvml \
+    psutil \
+    structlog \
+    prometheus-client
+
+# Создание пользователя vllm
+RUN groupadd -r vllm && useradd -r -g vllm vllm
+
+# Создание рабочих директорий
+RUN mkdir -p /workspace /models/huggingface /app/logs
+
+# Копирование наших файлов
+COPY model_manager.py /workspace/
+COPY dynamic_server.py /workspace/
+
+# Переменные окружения
+ENV PYTHONPATH="/workspace:$PYTHONPATH"
+ENV HF_HOME="/models/huggingface"
+ENV TRANSFORMERS_CACHE="/models/huggingface"
+ENV HF_HUB_CACHE="/models/huggingface"
+
+# Рабочая директория
+WORKDIR /workspace
+
+# Пользователь vllm
+USER vllm
+
+# Порты
+EXPOSE 8000 8001
+
+# Команда запуска
+CMD ["python", "dynamic_server.py"]

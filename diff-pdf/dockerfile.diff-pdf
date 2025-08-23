@@ -1,0 +1,74 @@
+FROM ubuntu:22.04
+
+# Метаданные
+LABEL maintainer="PDF Translator Pipeline"
+LABEL version="3.0"
+LABEL description="PDF Comparison Service with diff-pdf"
+
+# Установка системных зависимостей и diff-pdf
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        qtbase5-dev \
+        libpoppler-cpp-dev \
+        poppler-utils \
+        imagemagick \
+        python3 \
+        python3-pip \
+        python3-venv \
+        curl \
+        wget \
+        ghostscript \
+        libpoppler-dev \
+        autoconf \
+        automake \
+        libtool \
+        libglib2.0-dev \
+        libpoppler-glib-dev \
+        libcairo2-dev \
+        libwxgtk3.0-gtk3-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Сборка diff-pdf 0.5.2 из исходников
+RUN cd /tmp && \
+    curl -L -o v0.5.2.tar.gz https://github.com/vslavik/diff-pdf/archive/refs/tags/v0.5.2.tar.gz && \
+    tar -xzf v0.5.2.tar.gz && \
+    cd diff-pdf-0.5.2 && \
+    ./bootstrap && \
+    ./configure && \
+    make -j$(nproc) && \
+    make install && \
+    cd / && rm -rf /tmp/v0.5.2.tar.gz /tmp/diff-pdf-0.5.2
+
+# Создание рабочего пользователя
+RUN groupadd -r diffpdf && useradd -r -g diffpdf diffpdf
+
+# Создание рабочей директории
+WORKDIR /app
+
+# Создание необходимых директорий
+RUN mkdir -p /app/input /app/output /app/temp /app/logs \
+    && chown -R diffpdf:diffpdf /app \
+    && chmod -R 755 /app
+
+# Копирование скриптов для работы с diff-pdf
+COPY --chown=diffpdf:diffpdf compare_pdfs.py /app/compare_pdfs.py
+
+# Делаем скрипт исполняемым
+RUN chmod +x /app/compare_pdfs.py
+
+# Переключение на пользователя приложения
+USER 1000:1000
+
+# Установка переменных окружения
+ENV PYTHONPATH="/app"
+ENV PYTHONUNBUFFERED=1
+
+# Проверка здоровья
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+  CMD which diff-pdf || exit 1
+
+# Команда по умолчанию
+CMD ["tail", "-f", "/dev/null"]

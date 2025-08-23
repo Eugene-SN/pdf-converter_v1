@@ -1,0 +1,88 @@
+# Исправленный Dockerfile для Document Processor - обновлен предзагрузочный тест
+FROM python:3.11-slim
+
+# Обновление системных пакетов
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    git \
+    unzip \
+    libopencv-dev \
+    python3-opencv \
+    tesseract-ocr \
+    tesseract-ocr-chi-sim \
+    tesseract-ocr-eng \
+    tesseract-ocr-rus \
+    libtesseract-dev \
+    poppler-utils \
+    default-jre \
+    default-jdk \
+    libgl1 \
+    libglx-mesa0 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    build-essential \
+    python3-dev \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Создаем пользователя и настраиваем права
+RUN useradd -m -u 1000 docprocessor && \
+    mkdir -p /app/temp /app/cache \
+             /home/docprocessor/.paddlex \
+             /home/docprocessor/.cache \
+             /mnt/storage/models/paddlex \
+             /mnt/storage/models/docling && \
+    chown -R docprocessor:docprocessor /app \
+                                       /home/docprocessor \
+                                       /mnt/storage/models && \
+    chmod -R 775 /app \
+                 /home/docprocessor \
+                 /mnt/storage/models
+
+# Установка рабочей директории
+WORKDIR /app
+
+# Копирование файла requirements
+COPY requirements-docprocessor.txt /app/
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir -r requirements-docprocessor.txt
+
+# Копирование исходного кода
+COPY docling_processor.py /app/
+COPY ocr_processor.py /app/
+COPY table_extractor.py /app/
+COPY structure_analyzer.py /app/
+COPY main.py /app/
+
+# Установка прав на выполнение
+RUN chmod +x /app/*.py && \
+    chown -R docprocessor:docprocessor /app
+
+# Переменные окружения для PaddleOCR
+ENV PADDLEX_HOME=/mnt/storage/models/paddlex
+ENV HF_HOME=/mnt/storage/models/docling
+ENV TRANSFORMERS_CACHE=/mnt/storage/models/docling/transformers
+ENV HUGGINGFACE_HUB_CACHE=/mnt/storage/models/docling/huggingface
+ENV XDG_CACHE_HOME=/mnt/storage/models/docling
+ENV TMPDIR=/app/temp
+ENV TEMP=/app/temp
+ENV TMP=/app/temp
+ENV PADDLE_PDX_MODEL_SOURCE=BOS
+ENV HOME=/home/docprocessor
+ENV FLAGS_log_level=3
+
+USER docprocessor
+
+# Порт по умолчанию
+EXPOSE 8001 9001
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
+    CMD curl -f http://localhost:8001/health || exit 1
+
+# Команда запуска
+CMD ["python", "main.py"]
