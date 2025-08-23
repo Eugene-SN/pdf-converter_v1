@@ -2,8 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-FastAPI Main Server для Document Processor Service v4.0
-Основной HTTP сервер для обработки PDF документов через Docling, OCR и извлечение таблиц
+ИСПРАВЛЕННЫЙ FastAPI Main Server для Document Processor Service v4.0
+✅ УСТРАНЕНЫ ПРОБЛЕМЫ:
+- Условная инициализация OCR процессоров
+- Правильная обработка use_ocr флага
+- Динамическое создание Docling конвертера
+- Исправлена потеря текстового контента
 """
 
 import os
@@ -39,15 +43,15 @@ from prometheus_client import Counter, Histogram, Gauge, start_http_server, gene
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 import psutil
 
-# Наши процессоры
+# ✅ ИСПРАВЛЕНО: Импорты наших процессоров
 from docling_processor import DoclingProcessor, DoclingConfig, DocumentStructure
 from ocr_processor import OCRProcessor, OCRConfig
 from table_extractor import TableExtractor, TableConfig
 from structure_analyzer import StructureAnalyzer, AnalysisConfig
 
-# =======================================================================================
+# =============================================================================
 # КОНФИГУРАЦИЯ И НАСТРОЙКИ
-# =======================================================================================
+# =============================================================================
 
 class Settings(BaseSettings):
     """Настройки приложения"""
@@ -97,9 +101,9 @@ logging.basicConfig(
 )
 logger = structlog.get_logger("document_processor_api")
 
-# =======================================================================================
+# =============================================================================
 # PROMETHEUS МЕТРИКИ
-# =======================================================================================
+# =============================================================================
 
 def create_metric_safe(type_cls, name, description, labels=None):
     """Безопасное создание метрики - возвращает существующую или создает новую"""
@@ -125,16 +129,16 @@ pages_processed = create_metric_safe(Counter, 'doc_processor_pages_total', 'Tota
 memory_usage = create_metric_safe(Gauge, 'doc_processor_memory_usage_bytes', 'Memory usage')
 disk_usage = create_metric_safe(Gauge, 'doc_processor_disk_usage_percent', 'Disk usage percentage')
 
-# =======================================================================================
+# =============================================================================
 # PYDANTIC МОДЕЛИ
-# =======================================================================================
+# =============================================================================
 
 class ProcessingOptions(BaseModel):
     """Опции для обработки документа"""
     extract_tables: bool = True
     extract_images: bool = True
     extract_formulas: bool = True
-    use_ocr: bool = True
+    use_ocr: bool = False  # ✅ ИСПРАВЛЕНО: По умолчанию False для цифровых PDF
     high_quality_ocr: bool = True
     output_format: str = Field(default="json", pattern="^(json|markdown)$")
     language: str = "zh-CN"
@@ -161,9 +165,9 @@ class HealthResponse(BaseModel):
     services: Dict[str, str]
     system_info: Dict[str, Any]
 
-# =======================================================================================
+# =============================================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# =======================================================================================
+# =============================================================================
 
 def update_system_metrics():
     """Обновление системных метрик"""
@@ -209,46 +213,49 @@ async def save_uploaded_file(upload_file: UploadFile, temp_dir: str) -> str:
             await f.write(content)
         
         return str(file_path)
-        
+    
     except Exception as e:
         if file_path.exists():
             file_path.unlink()
         raise
 
-# =======================================================================================
+# =============================================================================
 # ИНИЦИАЛИЗАЦИЯ ПРОЦЕССОРОВ
-# =======================================================================================
+# =============================================================================
 
-# Глобальные процессоры (инициализируются при запуске)
+# ✅ ИСПРАВЛЕНО: Глобальные процессоры НЕ инициализируются при запуске
 docling_processor: Optional[DoclingProcessor] = None
 ocr_processor: Optional[OCRProcessor] = None
 table_extractor: Optional[TableExtractor] = None
 structure_analyzer: Optional[StructureAnalyzer] = None
 
 async def initialize_processors():
-    """Инициализация всех процессоров"""
+    """✅ ИСПРАВЛЕННАЯ инициализация процессоров без автоматической загрузки OCR"""
     global docling_processor, ocr_processor, table_extractor, structure_analyzer
     
     logger.info("Initializing document processors...")
     
     try:
-        # Docling
+        # ✅ ИСПРАВЛЕНО: Docling БЕЗ OCR по умолчанию
         docling_config = DoclingConfig(
             model_path=settings.docling_model_path,
             use_gpu=settings.docling_use_gpu,
             max_workers=settings.docling_max_workers,
             cache_dir=settings.cache_dir,
-            temp_dir=settings.temp_dir
+            temp_dir=settings.temp_dir,
+            enable_ocr_by_default=False  # ✅ По умолчанию OCR отключен
         )
         docling_processor = DoclingProcessor(docling_config)
+        logger.info("Docling processor initialized (OCR will be loaded on demand)")
         
-        # OCR
+        # ✅ ИСПРАВЛЕНО: OCR БЕЗ автоматической инициализации
         ocr_config = OCRConfig(
             use_gpu=settings.paddleocr_use_gpu,
             lang=settings.paddleocr_langs,
             confidence_threshold=settings.ocr_confidence_threshold,
         )
         ocr_processor = OCRProcessor(ocr_config)
+        logger.info("OCR processor created (engines will be loaded on demand)")
         
         # Tables
         table_config = TableConfig(
@@ -272,9 +279,9 @@ async def initialize_processors():
         logger.error(f"Failed to initialize processors: {e}")
         raise
 
-# =======================================================================================
+# =============================================================================
 # FASTAPI APPLICATION
-# =======================================================================================
+# =============================================================================
 
 app = FastAPI(
     title="Document Processor API",
@@ -295,9 +302,9 @@ app.add_middleware(
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# =======================================================================================
+# =============================================================================
 # API ENDPOINTS
-# =======================================================================================
+# =============================================================================
 
 @app.on_event("startup")
 async def startup_event():
@@ -323,7 +330,7 @@ async def health_check():
     # Проверяем статус сервисов
     services_status = {
         "docling": "healthy" if docling_processor else "unavailable",
-        "ocr": "healthy" if ocr_processor else "unavailable", 
+        "ocr": "ready" if ocr_processor else "unavailable", 
         "table_extractor": "healthy" if table_extractor else "unavailable",
         "structure_analyzer": "healthy" if structure_analyzer else "unavailable"
     }
@@ -351,10 +358,10 @@ async def health_check():
 @app.post("/convert", response_model=ProcessingResponse)
 async def convert_document(
     file: UploadFile = File(...),
-    options: str = Form(default='{"extract_tables": true, "extract_images": true, "use_ocr": true}')
+    options: str = Form(default='{"extract_tables": true, "extract_images": true, "use_ocr": false}')
 ):
     """
-    Конвертация PDF документа в структурированный JSON
+    ✅ ИСПРАВЛЕННАЯ конвертация PDF документа в структурированный JSON
     """
     start_time = time.time()
     active_requests.inc()
@@ -367,9 +374,9 @@ async def convert_document(
         try:
             processing_options = ProcessingOptions.parse_raw(options)
             logger.info(f"📥 Received conversion options: use_ocr={processing_options.use_ocr}, "
-                        f"extract_tables={processing_options.extract_tables}, "
-                        f"extract_images={processing_options.extract_images}, "
-                        f"extract_formulas={processing_options.extract_formulas}")
+                       f"extract_tables={processing_options.extract_tables}, "
+                       f"extract_images={processing_options.extract_images}, "
+                       f"extract_formulas={processing_options.extract_formulas}")
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid options format: {e}")
         
@@ -382,18 +389,21 @@ async def convert_document(
         
         logger.info(f"Starting document conversion: {document_id}")
         
-        # Основная обработка через Docling
+        # ✅ ИСПРАВЛЕНО: Основная обработка через Docling с правильным флагом OCR
         document_structure = await docling_processor.process_document(
-            pdf_path, str(work_dir),
-            use_ocr=processing_options.use_ocr
+            pdf_path, 
+            str(work_dir),
+            use_ocr=processing_options.use_ocr  # ✅ Передаем правильный флаг
         )
         
-        # Дополнительная обработка OCR если нужно
+        # ✅ ИСПРАВЛЕНО: Дополнительная обработка OCR ТОЛЬКО если включено
         if processing_options.use_ocr and ocr_processor:
+            logger.info("🔄 Запускаем дополнительную OCR обработку...")
             ocr_results = await ocr_processor.process_document_pages(
                 pdf_path, str(work_dir)
             )
             document_structure.metadata["ocr_results"] = ocr_results
+            logger.info(f"✅ OCR обработка завершена: {len(ocr_results)} страниц")
         
         # Улучшенное извлечение таблиц
         if processing_options.extract_tables and table_extractor:
@@ -413,18 +423,21 @@ async def convert_document(
         # Подготовка ответа
         processing_time = time.time() - start_time
         
+        # ✅ ИСПРАВЛЕНО: Правильная структура для сохранения
+        result_data = {
+            "title": document_structure.title,
+            "authors": document_structure.authors,
+            "sections": document_structure.sections,
+            "tables": [{"id": getattr(t, 'id', i), "page": getattr(t, 'page', 1), "file_path": getattr(t, 'file_path', '')} for i, t in enumerate(document_structure.tables)],
+            "images": [{"id": img.get("id", i), "page": img.get("page", 1), "file_path": img.get("file_path", '')} for i, img in enumerate(document_structure.images)],
+            "formulas": document_structure.formulas,
+            "metadata": document_structure.metadata
+        }
+        
         # Сохраняем результат в JSON
         result_file = work_dir / "document_structure.json"
         with open(result_file, 'w', encoding='utf-8') as f:
-            json.dump({
-                "title": document_structure.title,
-                "authors": document_structure.authors,
-                "sections": document_structure.sections,
-                "tables": [{"id": t.id, "page": t.page, "file_path": t.file_path} for t in document_structure.tables],
-                "images": [{"id": i["id"], "page": i["page"], "file_path": i["file_path"]} for i in document_structure.images],
-                "formulas": document_structure.formulas,
-                "metadata": document_structure.metadata
-            }, f, ensure_ascii=False, indent=2)
+            json.dump(result_data, f, ensure_ascii=False, indent=2)
         
         # Метрики
         processing_duration.labels(type="convert").observe(processing_time)
@@ -460,17 +473,17 @@ async def convert_document(
             status_code=500,
             detail=f"Document conversion failed: {str(e)}"
         )
-        
+    
     finally:
         active_requests.dec()
 
 @app.post("/markdown")
 async def convert_to_markdown(
     file: UploadFile = File(...),
-    options: str = Form(default='{"extract_tables": true, "extract_images": true}')
+    options: str = Form(default='{"extract_tables": true, "extract_images": true, "use_ocr": false}')
 ):
     """
-    Конвертация PDF в Markdown формат
+    ✅ ИСПРАВЛЕННАЯ конвертация PDF в Markdown формат
     """
     start_time = time.time()
     active_requests.inc()
@@ -531,7 +544,7 @@ async def get_status():
         "timestamp": datetime.now().isoformat(),
         "processors": {
             "docling": bool(docling_processor),
-            "ocr": bool(ocr_processor),
+            "ocr": bool(ocr_processor) and ocr_processor.is_initialized(),
             "table_extractor": bool(table_extractor),
             "structure_analyzer": bool(structure_analyzer)
         },
@@ -539,12 +552,16 @@ async def get_status():
             "max_file_size_mb": settings.max_file_size / 1024 / 1024,
             "timeout_seconds": settings.timeout_seconds,
             "temp_dir": settings.temp_dir
+        },
+        "ocr_info": {
+            "available_engines": ocr_processor.get_available_engines() if ocr_processor else {},
+            "initialized": ocr_processor.is_initialized() if ocr_processor else False
         }
     }
 
-# =======================================================================================
+# =============================================================================
 # MAIN
-# =======================================================================================
+# =============================================================================
 
 startup_time = time.time()
 
