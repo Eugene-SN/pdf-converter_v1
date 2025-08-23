@@ -8,344 +8,516 @@
 
 set -euo pipefail
 
-# Конфигурация
+# =============================================================================
+# КОНФИГУРАЦИЯ
+# =============================================================================
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/.env"
-
-# Локальные папки для скрипта на хосте
-HOST_INPUT_DIR="${SCRIPT_DIR}/input_pdf"
-HOST_OUTPUT_DIR="${SCRIPT_DIR}/output_md_zh"
-LOGS_DIR="${SCRIPT_DIR}/logs"
 
 # Цвета для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m'
+NC='\033[0m' # No Color
 
-# Загрузка конфигурации
-if [ -f "$CONFIG_FILE" ]; then
-    source "$CONFIG_FILE"
-fi
+# Конфигурация сервисов (берем из env HOST переменных; fallback на прежние дефолты)
+AIRFLOW_URL="${AIRFLOW_BASE_URL_HOST:-http://localhost:8090}"
+DOCUMENT_PROCESSOR_URL="${DOCUMENT_PROCESSOR_URL_HOST:-http://localhost:8001}"
+VLLM_URL="${VLLM_SERVER_URL_HOST:-http://localhost:8000}"
+QA_URL="${QUALITY_ASSURANCE_URL_HOST:-http://localhost:8002}"
+TRANSLATOR_URL="${TRANSLATOR_URL_HOST:-http://localhost:8003}"
 
-# URL сервисов
-AIRFLOW_BASE_URL="http://localhost:8090"
-AIRFLOW_USERNAME=${AIRFLOW_USERNAME:-"admin"}
-AIRFLOW_PASSWORD=${AIRFLOW_PASSWORD:-"admin"}
+AIRFLOW_USERNAME="${AIRFLOW_USERNAME:-admin}"
+AIRFLOW_PASSWORD="${AIRFLOW_PASSWORD:-admin}"
 
-# Создание директорий
-mkdir -p "$HOST_INPUT_DIR" "$HOST_OUTPUT_DIR" "$LOGS_DIR"
+# Параметры по умолчанию
+DEFAULT_TARGET_LANGUAGE=""         # Целевой язык на этапе препроцессинга НЕ используется
+DEFAULT_QUALITY_LEVEL="high"
+DEFAULT_USE_OCR=false # ✅ ИСПРАВЛЕНО: По умолчанию OCR отключен для цифровых PDF
 
-log() {
-    local level="$1"
-    shift
-    local message="$*"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo -e "${BLUE}[$timestamp]${NC} ${YELLOW}[$level]${NC} $message" | tee -a "$LOGS_DIR/stage1_$(date +%Y%m%d_%H%M%S).log"
+# Локальные папки для скрипта на хосте
+HOST_INPUT_DIR="${SCRIPT_DIR}/input_pdf"
+HOST_OUTPUT_DIR="${SCRIPT_DIR}/output_md_zh"
+LOGS_DIR="${SCRIPT_DIR}/logs"
+
+# =============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =============================================================================
+
+print_header() {
+  echo -e "${BLUE}=================================="
+  echo -e "✅ ИСПРАВЛЕННЫЙ PDF CONVERTER v4.0"
+  echo -e "Stage 1: Document Preprocessing"
+  echo -e "==================================${NC}"
 }
 
-show_header() {
-    echo -e "${BLUE}"
-    echo "==============================================================================="
-    echo "  PDF CONVERTER PIPELINE v2.0 - ЭТАП 1: КОНВЕРТАЦИЯ В MARKDOWN"
-    echo "==============================================================================="
-    echo -e "${NC}"
-    echo "🎯 Цель: PDF → Markdown (китайский оригинал)"
-    echo "📂 Входная папка: $HOST_INPUT_DIR"
-    echo "📁 Выходная папка: $HOST_OUTPUT_DIR"
-    echo ""
+print_error() {
+  echo -e "${RED}❌ ОШИБКА: $1${NC}"
 }
 
-check_services() {
-    log "INFO" "Проверка готовности сервисов..."
-    
-    # Проверка Airflow
-    if ! curl -s --user "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD" "$AIRFLOW_BASE_URL/health" > /dev/null 2>&1; then
-        log "ERROR" "Airflow UI недоступен на $AIRFLOW_BASE_URL"
-        log "INFO" "Убедитесь что система запущена: ./start-system.sh"
+print_success() {
+  echo -e "${GREEN}✅ $1${NC}"
+}
+
+print_warning() {
+  echo -e "${YELLOW}⚠️ $1${NC}"
+}
+
+print_info() {
+  echo -e "${BLUE}ℹ️ $1${NC}"
+}
+
+# Проверка доступности сервиса
+check_service() {
+  local service_url=$1
+  local service_name=$2
+  local timeout=10
+  print_info "Проверяем доступность $service_name..."
+  if curl -s --max-time $timeout "$service_url/health" > /dev/null 2>&1; then
+    print_success "$service_name доступен"
+    return 0
+  else
+    print_error "$service_name недоступен по адресу $service_url"
+    return 1
+  fi
+}
+
+# ✅ ИСПРАВЛЕНО: Проверка состояния Document Processor
+check_document_processor() {
+  print_info "Проверяем состояние Document Processor..."
+  local response
+  response=$(curl -s "$DOCUMENT_PROCESSOR_URL/status" 2>/dev/null || echo "")
+  if [ -n "$response" ]; then
+    local ocr_initialized
+    ocr_initialized=$(echo "$response" | jq -r '.processors.ocr // false' 2>/dev/null || echo "false")
+    local docling_status
+    docling_status=$(echo "$response" | jq -r '.processors.docling // false' 2>/dev/null || echo "false")
+    print_info "Статус Document Processor:"
+    print_info "  - Docling: $docling_status"
+    print_info "  - OCR инициализирован: $ocr_initialized"
+    if [ "$docling_status" = "true" ]; then
+      print_success "Document Processor готов к работе"
+      return 0
+    else
+      print_warning "Document Processor не полностью готов"
+      return 1
+    fi
+  else
+    print_error "Не удалось получить статус Document Processor"
+    return 1
+  fi
+}
+
+# Проверка готовности Airflow
+check_airflow() {
+  print_info "Проверяем доступность Airflow..."
+  # Проверяем health endpoint
+  if ! check_service "$AIRFLOW_URL" "Airflow"; then
+    return 1
+  fi
+  # Проверяем доступность API
+  local auth_header
+  auth_header="Authorization: Basic $(echo -n "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD" | base64)"
+  local api_response
+  api_response=$(curl -s -H "$auth_header" "$AIRFLOW_URL/api/v1/dags" 2>/dev/null || echo "")
+  if [ -n "$api_response" ]; then
+    print_success "Airflow API доступен"
+    return 0
+  else
+    print_error "Airflow API недоступен"
+    return 1
+  fi
+}
+
+# =============================================================================
+# ОСНОВНЫЕ ФУНКЦИИ
+# =============================================================================
+
+show_usage() {
+  echo "Использование: $0 [options] [input_file]"
+  echo ""
+  echo "Параметры:"
+  echo "  input_file                 Путь к PDF файлу для обработки (не обязателен; иначе будет предложен выбор из ${HOST_INPUT_DIR})"
+  echo ""
+  echo "Опции:"
+  echo "  --target-language LANG     [НЕ ИСПОЛЬЗУЕТСЯ НА ЭТОМ ЭТАПЕ] Целевой язык задается только на этапе перевода"
+  echo "  --quality-level LEVEL      Уровень качества (high, medium, fast). По умолчанию: $DEFAULT_QUALITY_LEVEL"
+  echo "  --use-ocr                  Включить OCR для сканированных PDF"
+  echo "  --no-ocr                   Отключить OCR (по умолчанию для цифровых PDF)"
+  echo "  --extract-tables           Извлекать таблицы (включено по умолчанию)"
+  echo "  --no-extract-tables        Отключить извлечение таблиц"
+  echo "  --extract-images           Извлекать изображения (включено по умолчанию)"
+  echo "  --no-extract-images        Отключить извлечение изображений"
+  echo "  --batch                    Пакетная обработка всех PDF из ${HOST_INPUT_DIR}"
+  echo "  --help                     Показать справку"
+  echo ""
+  echo "Примеры:"
+  echo "  $0"
+  echo "  $0 --no-ocr --quality-level high"
+  echo "  $0 /path/to/scanned.pdf --use-ocr"
+}
+
+list_input_dir_files() {
+  if [ ! -d "$HOST_INPUT_DIR" ]; then
+    print_error "Каталог не найден: $HOST_INPUT_DIR"
+    exit 1
+  fi
+  mapfile -t PDF_FILES < <(find "$HOST_INPUT_DIR" -maxdepth 1 -type f -name "*.pdf" | sort)
+  if [ ${#PDF_FILES[@]} -eq 0 ]; then
+    print_error "В каталоге $HOST_INPUT_DIR нет PDF файлов"
+    exit 1
+  fi
+}
+
+prompt_select_file() {
+  list_input_dir_files
+  echo "Доступные PDF файлы в $HOST_INPUT_DIR:"
+  local idx=1
+  for f in "${PDF_FILES[@]}"; do
+    echo "  [$idx] $(basename "$f")"
+    idx=$((idx+1))
+  done
+  echo -n "Выберите номер файла для обработки: "
+  read -r sel
+  if ! [[ "$sel" =~ ^[0-9]+$ ]]; then
+    print_error "Некорректный номер"
+    exit 1
+  fi
+  if [ "$sel" -lt 1 ] || [ "$sel" -gt ${#PDF_FILES[@]} ]; then
+    print_error "Номер вне диапазона"
+    exit 1
+  fi
+  INPUT_FILE="${PDF_FILES[$((sel-1))]}"
+}
+
+# Парсинг аргументов командной строки
+parse_arguments() {
+  INPUT_FILE=""
+  TARGET_LANGUAGE="$DEFAULT_TARGET_LANGUAGE" # не используется на этом этапе
+  QUALITY_LEVEL="$DEFAULT_QUALITY_LEVEL"
+  USE_OCR="$DEFAULT_USE_OCR" # ✅ ИСПРАВЛЕНО: По умолчанию false
+  EXTRACT_TABLES=true
+  EXTRACT_IMAGES=true
+  BATCH_MODE=false
+
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --help)
+        show_usage
+        exit 0
+        ;;
+      --target-language)
+        TARGET_LANGUAGE="$2"
+        shift 2
+        ;;
+      --quality-level)
+        QUALITY_LEVEL="$2"
+        shift 2
+        ;;
+      --use-ocr)
+        USE_OCR=true
+        shift
+        ;;
+      --no-ocr)
+        USE_OCR=false
+        shift
+        ;;
+      --extract-tables)
+        EXTRACT_TABLES=true
+        shift
+        ;;
+      --no-extract-tables)
+        EXTRACT_TABLES=false
+        shift
+        ;;
+      --extract-images)
+        EXTRACT_IMAGES=true
+        shift
+        ;;
+      --no-extract-images)
+        EXTRACT_IMAGES=false
+        shift
+        ;;
+      --batch)
+        BATCH_MODE=true
+        shift
+        ;;
+      -*)
+        print_error "Неизвестная опция: $1"
+        show_usage
         exit 1
-    fi
-    
-    # Проверка Document Processor - ИСПРАВЛЕНО: localhost вместо имени контейнера
-    local doc_proc_url="http://localhost:8001"
-    if ! curl -s "$doc_proc_url/health" > /dev/null 2>&1; then
-        log "ERROR" "Document Processor недоступен на $doc_proc_url"
-        log "INFO" "Проверьте что контейнер document-processor запущен"
-        exit 1
-    fi
-    
-    # Проверка vLLM - ИСПРАВЛЕНО: localhost вместо имени контейнера
-    local vllm_url="http://localhost:8000"
-    if ! curl -s "$vllm_url/health" > /dev/null 2>&1; then
-        log "ERROR" "vLLM Server недоступен на $vllm_url"
-        log "INFO" "Проверьте что контейнер vllm-server запущен и загрузил модель"
-        exit 1
-    fi
-    
-    log "INFO" "✅ Все необходимые сервисы готовы"
-}
-
-trigger_dag() {
-    local dag_id="$1"
-    local config="$2"
-    local description="$3"
-    
-    log "INFO" "🚀 Запуск $description..."
-    
-    # Создание JSON конфигурации
-    local json_config=$(echo "$config" | python3 -c "
-import sys, json
-try:
-    config_dict = {}
-    for line in sys.stdin:
-        if '=' in line:
-            key, value = line.strip().split('=', 1)
-            # Попытка преобразовать в правильный тип
-            if value.lower() in ['true', 'false']:
-                config_dict[key] = value.lower() == 'true'
-            elif value.isdigit():
-                config_dict[key] = int(value)
-            else:
-                config_dict[key] = value
-    print(json.dumps(config_dict))
-except Exception as e:
-    print('{}')
-")
-    
-    # Запуск DAG через API
-    local response=$(curl -s -w "\n%{http_code}" \
-        -X POST \
-        --user "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD" \
-        -H "Content-Type: application/json" \
-        -d "{\"conf\": $json_config}" \
-        "$AIRFLOW_BASE_URL/api/v1/dags/$dag_id/dagRuns")
-    
-    local http_code=$(echo "$response" | tail -n1)
-    local body=$(echo "$response" | head -n -1)
-    
-    if [ "$http_code" -eq 200 ] || [ "$http_code" -eq 201 ]; then
-        local dag_run_id=$(echo "$body" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('dag_run_id', 'unknown'))" 2>/dev/null || echo "unknown")
-        log "INFO" "✅ DAG запущен. Run ID: $dag_run_id"
-        echo "$dag_run_id"
-    else
-        log "ERROR" "❌ Ошибка запуска DAG: HTTP $http_code"
-        log "ERROR" "Ответ: $body"
-        return 1
-    fi
-}
-
-wait_for_dag_completion() {
-    local dag_id="$1"
-    local dag_run_id="$2"
-    local description="$3"
-    local timeout=${4:-1800}  # 30 минут по умолчанию
-    
-    log "INFO" "⏳ Ожидание завершения $description (таймаут: ${timeout}s)..."
-    
-    local start_time=$(date +%s)
-    local dots=0
-    
-    while true; do
-        local current_time=$(date +%s)
-        local elapsed=$((current_time - start_time))
-        
-        if [ $elapsed -gt $timeout ]; then
-            log "ERROR" "❌ Таймаут ожидания $description"
-            return 1
-        fi
-        
-        # Получение статуса DAG
-        local response=$(curl -s \
-            --user "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD" \
-            "$AIRFLOW_BASE_URL/api/v1/dags/$dag_id/dagRuns/$dag_run_id")
-        
-        local state=$(echo "$response" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    print(data.get('state', 'unknown'))
-except:
-    print('error')
-" 2>/dev/null || echo "error")
-        
-        case "$state" in
-            "success")
-                log "INFO" "✅ $description завершен успешно"
-                return 0
-                ;;
-            "failed"|"upstream_failed")
-                log "ERROR" "❌ $description завершен с ошибкой"
-                return 1
-                ;;
-            "running")
-                # Показываем прогресс
-                dots=$(((dots + 1) % 4))
-                local progress_dots=$(printf "%*s" $dots '' | tr ' ' '.')
-                printf "\r${YELLOW}[ВЫПОЛНЯЕТСЯ]${NC} $description$progress_dots   "
-                sleep 5
-                ;;
-            *)
-                sleep 3
-                ;;
-        esac
-    done
-}
-
-process_single_file() {
-    local pdf_file="$1"
-    local filename=$(basename "$pdf_file")
-    local timestamp=$(date +%s)
-    
-    log "INFO" "📄 Начинаем обработку: $filename"
-    
-    # Конфигурация для этапа 1 (только конвертация)
-    local stage1_config="
-        input_file=$pdf_file
-        filename=$filename
-        timestamp=$timestamp
-        target_language=zh
-        quality_level=high
-        use_ocr=false
-        preserve_structure=true
-        extract_tables=true
-        extract_images=true
-        stage_mode=conversion_only
-        processing_stages=2"
-    
-    # Этап 1.1: Document Preprocessing
-    local dag1_run_id
-    dag1_run_id=$(trigger_dag "document_preprocessing" "$stage1_config" "Document Preprocessing")
-    
-    if [ $? -eq 0 ]; then
-        if wait_for_dag_completion "document_preprocessing" "$dag1_run_id" "Document Preprocessing" 1800; then
-            log "INFO" "✅ Этап 1.1 завершен: извлечение контента"
+        ;;
+      *)
+        if [ -z "$INPUT_FILE" ]; then
+          INPUT_FILE="$1"
         else
-            log "ERROR" "❌ Ошибка в этапе 1.1"
-            return 1
+          print_error "Слишком много аргументов: $1"
+          show_usage
+          exit 1
         fi
-    else
-        log "ERROR" "❌ Не удалось запустить Document Preprocessing"
-        return 1
-    fi
-    
-    # Этап 1.2: Content Transformation
-    local stage2_config="
-        intermediate_file=/tmp/dag1_results_${timestamp}.json
-        original_config=$stage1_config
-        dag1_completed=true
-        vllm_model=Qwen/Qwen2.5-VL-32B-Instruct
-        transformation_quality=high
-        preserve_technical_terms=true"
-    
-    local dag2_run_id
-    dag2_run_id=$(trigger_dag "content_transformation" "$stage2_config" "Content Transformation")
-    
-    if [ $? -eq 0 ]; then
-        if wait_for_dag_completion "content_transformation" "$dag2_run_id" "Content Transformation" 1200; then
-            log "INFO" "✅ Этап 1.2 завершен: преобразование в Markdown"
-            
-            # Проверка результата
-            local output_file="$HOST_OUTPUT_DIR/${timestamp}_${filename%.pdf}.md"
-            if [ -f "$output_file" ]; then
-                log "INFO" "📁 Результат сохранен: $output_file"
-                return 0
-            else
-                log "WARN" "⚠️ Файл результата не найден: $output_file"
-                return 1
-            fi
-        else
-            log "ERROR" "❌ Ошибка в этапе 1.2"
-            return 1
-        fi
-    else
-        log "ERROR" "❌ Не удалось запустить Content Transformation"
-        return 1
-    fi
+        shift
+        ;;
+    esac
+  done
+
+  # Если пакетный режим - не проверяем одиночный INPUT_FILE
+  if [ "$BATCH_MODE" = true ]; then
+    return 0
+  fi
+
+  # Если не передан файл - предложить выбрать из HOST_INPUT_DIR
+  if [ -z "$INPUT_FILE" ]; then
+    prompt_select_file
+  fi
+
+  # Проверяем существование файла
+  if [ ! -f "$INPUT_FILE" ]; then
+    print_error "Файл не найден: $INPUT_FILE"
+    exit 1
+  fi
+
+  # Проверяем что файл PDF
+  if [[ ! "$INPUT_FILE" =~ \.pdf$ ]]; then
+    print_error "Файл должен иметь расширение .pdf: $INPUT_FILE"
+    exit 1
+  fi
 }
 
-process_batch() {
-    log "INFO" "🔍 Поиск PDF файлов в $HOST_INPUT_DIR"
-    
-    # Поиск всех PDF файлов
-    local pdf_files=()
-    while IFS= read -r -d '' file; do
-        pdf_files+=("$file")
-    done < <(find "$HOST_INPUT_DIR" -name "*.pdf" -type f -print0)
-    
-    local total_files=${#pdf_files[@]}
-    
-    if [ $total_files -eq 0 ]; then
-        log "WARN" "📂 Нет PDF файлов в $HOST_INPUT_DIR"
-        echo "Поместите PDF файлы в папку $HOST_INPUT_DIR и запустите снова"
-        return 0
+# Валидация параметров
+validate_parameters() {
+  print_info "Валидация параметров..."
+  # Уровень качества
+  case "$QUALITY_LEVEL" in
+    high|medium|fast)
+      print_success "Уровень качества: $QUALITY_LEVEL"
+      ;;
+    *)
+      print_error "Неподдерживаемый уровень качества: $QUALITY_LEVEL"
+      print_info "Поддерживаемые уровни: high, medium, fast"
+      exit 1
+      ;;
+  esac
+
+  # Если одиночный режим - проверка размера файла
+  if [ -n "$INPUT_FILE" ] && [ "$BATCH_MODE" = false ]; then
+    local file_size
+    file_size=$(stat -f%z "$INPUT_FILE" 2>/dev/null || stat -c%s "$INPUT_FILE" 2>/dev/null || echo "0")
+    local max_size=$((500 * 1024 * 1024)) # 500MB
+    if [ "$file_size" -gt "$max_size" ]; then
+      print_error "Файл слишком большой: ${file_size} байт (максимум: ${max_size})"
+      exit 1
     fi
-    
-    log "INFO" "📊 Найдено файлов для обработки: $total_files"
-    echo ""
-    
-    # Обработка файлов
-    local processed=0
-    local failed=0
-    local start_time=$(date +%s)
-    
-    for pdf_file in "${pdf_files[@]}"; do
-        local filename=$(basename "$pdf_file")
-        echo -e "${BLUE}[ФАЙЛ $((processed + failed + 1))/$total_files]${NC} $filename"
-        
-        if process_single_file "$pdf_file"; then
-            ((processed++))
-            echo -e "Статус: ${GREEN}✅ УСПЕШНО${NC}"
-        else
-            ((failed++))
-            echo -e "Статус: ${RED}❌ ОШИБКА${NC}"
-        fi
-        
-        echo ""
-    done
-    
-    # Итоговая статистика
-    local end_time=$(date +%s)
-    local total_duration=$((end_time - start_time))
-    
-    echo "==============================================================================="
-    echo -e "${GREEN}ЭТАП 1 ЗАВЕРШЕН: КОНВЕРТАЦИЯ В MARKDOWN${NC}"
-    echo "==============================================================================="
-    echo -e "📊 Статистика обработки:"
-    echo -e "   Успешно обработано: ${GREEN}$processed${NC} файлов"
-    echo -e "   Ошибок: ${RED}$failed${NC} файлов"
-    echo -e "   Общее время: ${BLUE}$total_duration${NC} секунд"
-    echo ""
-    echo -e "📁 Результаты сохранены в: ${YELLOW}$HOST_OUTPUT_DIR${NC}"
-    echo -e "📋 Логи сохранены в: ${YELLOW}$LOGS_DIR${NC}"
-    echo ""
-    
-    if [ $failed -gt 0 ]; then
-        echo -e "${YELLOW}⚠️ Рекомендации:${NC}"
-        echo "   - Проверьте логи для диагностики ошибок"
-        echo "   - Убедитесь что PDF файлы не повреждены"
-        echo "   - Проверьте доступность всех сервисов"
-    else
-        echo -e "${GREEN}🎉 Все файлы успешно конвертированы в Markdown!${NC}"
-        echo ""
-        echo "Следующие шаги:"
-        echo "   - Для валидации: ./process-stage2.sh"
-        echo "   - Для перевода: ./process-stage3.sh [язык]"
-    fi
+    print_success "Размер файла: $(echo "$file_size" | awk '{printf "%.2f MB", $1/1024/1024}')"
+  fi
 }
 
-# Основная логика
+# ✅ ИСПРАВЛЕНО: Формирование корректного payload и запуск DAG
+trigger_single_file() {
+  local file_path="$1"
+  local abs_input_file filename timestamp auth_header api_url dag_config response dag_run_id
+
+  print_info "Запуск DAG document_preprocessing..."
+
+  abs_input_file=$(realpath "$file_path")
+  filename=$(basename "$file_path")
+  timestamp=$(date +%s)
+
+  # Конфигурация conf для DAG 1 (без target_language на этом этапе)
+  # Минимальный набор: input_file, filename, timestamp, use_ocr, extract_* и т.п. —
+  # но передаем всё через conf, как ожидает Airflow v1 API.
+  dag_config=$(jq -n \
+    --arg input_file "$abs_input_file" \
+    --arg filename "$filename" \
+    --argjson use_ocr $USE_OCR \
+    --arg quality_level "$QUALITY_LEVEL" \
+    --argjson extract_tables $EXTRACT_TABLES \
+    --argjson extract_images $EXTRACT_IMAGES \
+    --arg language "zh-CN" \
+    --argjson timestamp $timestamp \
+    '{
+      conf: {
+        input_file: $input_file,
+        filename: $filename,
+        use_ocr: $use_ocr,
+        quality_level: $quality_level,
+        extract_tables: $extract_tables,
+        extract_images: $extract_images,
+        extract_formulas: true,
+        high_quality_ocr: true,
+        preserve_structure: true,
+        timestamp: $timestamp,
+        language: $language,
+        chinese_optimization: true,
+        pipeline_version: "4.0",
+        processing_mode: "digital_pdf"
+      }
+    }'
+  )
+
+  print_info "Конфигурация DAG:"
+  echo "$dag_config" | jq '.' 2>/dev/null || echo "$dag_config"
+
+  auth_header="Authorization: Basic $(echo -n "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD" | base64)"
+  api_url="$AIRFLOW_URL/api/v1/dags/document_preprocessing/dagRuns"
+
+  print_info "Отправляем запрос к Airflow API..."
+  response=$(curl -s -X POST \
+    -H "Content-Type: application/json" \
+    -H "$auth_header" \
+    -d "$dag_config" \
+    "$api_url" 2>/dev/null || echo "")
+
+  if [ -n "$response" ]; then
+    dag_run_id=$(echo "$response" | jq -r '.dag_run_id // empty' 2>/dev/null || echo "")
+    if [ -n "$dag_run_id" ]; then
+      print_success "DAG запущен успешно!"
+      print_info "DAG Run ID: $dag_run_id"
+      local monitoring_url="$AIRFLOW_URL/dags/document_preprocessing/grid?dag_run_id=$dag_run_id"
+      print_info "Мониторинг: $monitoring_url"
+      return 0
+    else
+      print_error "Не удалось получить DAG Run ID из ответа"
+      print_info "Ответ API: $response"
+      return 1
+    fi
+  else
+    print_error "Не удалось запустить DAG - пустой ответ от API"
+    return 1
+  fi
+}
+
+trigger_batch() {
+  list_input_dir_files
+  local failures=0
+  for f in "${PDF_FILES[@]}"; do
+    print_info "-----"
+    print_info "Обработка файла: $(basename "$f")"
+    if ! trigger_single_file "$f"; then
+      failures=$((failures+1))
+      print_warning "Файл завершился с ошибкой запуска: $(basename "$f")"
+    fi
+  done
+  if [ "$failures" -gt 0 ]; then
+    print_warning "Пакетная обработка завершена с ошибками: $failures"
+    return 1
+  else
+    print_success "Пакетная обработка завершена успешно"
+    return 0
+  fi
+}
+
+# Мониторинг выполнения DAG
+monitor_dag_execution() {
+  local dag_run_id="$1"
+  local timeout=1800 # 30 минут
+  local interval=10 # Проверяем каждые 10 секунд
+  local elapsed=0
+  print_info "Мониторинг выполнения DAG (timeout: ${timeout}s)..."
+  local auth_header="Authorization: Basic $(echo -n "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD" | base64)"
+  while [ $elapsed -lt $timeout ]; do
+    local api_url="$AIRFLOW_URL/api/v1/dags/document_preprocessing/dagRuns/$dag_run_id"
+    local response
+    response=$(curl -s -H "$auth_header" "$api_url" 2>/dev/null || echo "")
+    if [ -n "$response" ]; then
+      local state
+      state=$(echo "$response" | jq -r '.state // "unknown"' 2>/dev/null || echo "unknown")
+      case "$state" in
+        "success")
+          print_success "DAG выполнен успешно!"
+          return 0
+          ;;
+        "failed")
+          print_error "DAG завершился с ошибкой"
+          return 1
+          ;;
+        "running")
+          print_info "DAG выполняется... (${elapsed}s)"
+          ;;
+        *)
+          print_info "Состояние DAG: $state (${elapsed}s)"
+          ;;
+      esac
+    else
+      print_warning "Не удалось получить статус DAG"
+    fi
+    sleep $interval
+    elapsed=$((elapsed + interval))
+  done
+  print_error "Timeout мониторинга DAG (${timeout}s)"
+  return 1
+}
+
+# =============================================================================
+# ГЛАВНАЯ ФУНКЦИЯ
+# =============================================================================
+
 main() {
-    show_header
-    check_services
-    
-    echo -e "${YELLOW}Нажмите Enter для начала обработки или Ctrl+C для отмены...${NC}"
-    read -r
-    
-    process_batch
+  print_header
+
+  # Парсим аргументы
+  parse_arguments "$@"
+
+  # Показываем конфигурацию
+  print_info "Конфигурация обработки:"
+  if [ "$BATCH_MODE" = true ]; then
+    print_info "  - Режим: пакетная обработка папки ${HOST_INPUT_DIR}"
+  else
+    print_info "  - Входной файл: ${INPUT_FILE}"
+  fi
+  # На этом этапе целевой язык не задается — перевод позже
+  print_info "  - Уровень качества: $QUALITY_LEVEL"
+  print_info "  - Использовать OCR: $USE_OCR" # ✅ ИСПРАВЛЕНО: Показываем правильное значение
+  print_info "  - Извлекать таблицы: $EXTRACT_TABLES"
+  print_info "  - Извлекать изображения: $EXTRACT_IMAGES"
+
+  # Валидация параметров
+  validate_parameters
+
+  # Проверяем доступность сервисов
+  print_info "Проверка состояния сервисов..."
+
+  if ! check_airflow; then
+    print_error "Airflow недоступен. Проверьте что сервисы запущены: docker-compose up -d"
+    exit 1
+  fi
+
+  if ! check_document_processor; then
+    print_error "Document Processor недоступен или не готов"
+    print_info "Проверьте логи: docker logs document-processor"
+    exit 1
+  fi
+
+  print_success "Все сервисы готовы к работе"
+
+  # Запускаем DAG
+  if [ "$BATCH_MODE" = true ]; then
+    if trigger_batch; then
+      print_success "✅ STAGE 1 (batch) ЗАПУЩЕН УСПЕШНО!"
+      print_info ""
+      print_info "Следующие шаги:"
+      print_info "1. Мониторить прогресс в Airflow UI: $AIRFLOW_URL"
+      print_info "2. После завершения запустить Stage 2: ./process-stage2.sh"
+      print_info "3. Проверить логи: docker logs document-processor"
+    else
+      print_error "Не удалось запустить Stage 1 (batch)"
+      exit 1
+    fi
+  else
+    if trigger_single_file "$INPUT_FILE"; then
+      print_success "✅ STAGE 1 ЗАПУЩЕН УСПЕШНО!"
+      print_info ""
+      print_info "Следующие шаги:"
+      print_info "1. Мониторить прогресс в Airflow UI: $AIRFLOW_URL"
+      print_info "2. После завершения запустить Stage 2: ./process-stage2.sh"
+      print_info "3. Проверить логи: docker logs document-processor"
+    else
+      print_error "Не удалось запустить Stage 1"
+      exit 1
+    fi
+  fi
 }
 
-# Запуск, если скрипт вызван напрямую
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
-fi
+# Запускаем главную функцию
+main "$@"
