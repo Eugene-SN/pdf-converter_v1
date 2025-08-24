@@ -90,14 +90,18 @@ check_document_processor() {
   local response
   response=$(curl -s "$DOCUMENT_PROCESSOR_URL/status" 2>/dev/null || echo "")
   if [ -n "$response" ]; then
+    # теперь docling может быть строкой "official_api"
+    local docling_status
+    docling_status=$(echo "$response" | jq -r '.processors.docling // ""' 2>/dev/null || echo "")
     local ocr_initialized
     ocr_initialized=$(echo "$response" | jq -r '.processors.ocr // false' 2>/dev/null || echo "false")
-    local docling_status
-    docling_status=$(echo "$response" | jq -r '.processors.docling // false' 2>/dev/null || echo "false")
+
     print_info "Статус Document Processor:"
     print_info "  - Docling: $docling_status"
     print_info "  - OCR инициализирован: $ocr_initialized"
-    if [ "$docling_status" = "true" ]; then
+
+    # считаем здоровым любой непустой docling_status, кроме "unavailable" или "false"
+    if [[ "$docling_status" != "" && "$docling_status" != "false" && "$docling_status" != "unavailable" ]]; then
       print_success "Document Processor готов к работе"
       return 0
     else
